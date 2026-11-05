@@ -464,6 +464,7 @@ def build_attn_metadata(
     copy_sfa_restore_tails: bool = False,
     draft_layer_names: set[str] | None = None,
     common_metadata_callback=None,
+    sawtooth_sas_cache: Any | None = None,
 ) -> dict[str, Any]:
     """Build attention metadata for Ascend NPUs."""
     if skip_ring_state_update is None:
@@ -637,6 +638,7 @@ def build_attn_metadata(
                 attn_metadata_extra_kwargs.update(
                     num_actual_reqs=num_actual_reqs,
                     common_ratio_to_sas_metadata=common_ratio_to_sas_metadata,
+                    sawtooth_sas_cache=sawtooth_sas_cache,
                     # FULL graphs replay the padded batch; DSA PCP restore
                     # indices must span the padded extent. Mirror the V4.1
                     # branch so the flag also reaches builders during capture.

@@ -287,7 +287,7 @@ def test_profile_scope_needs_no_kv_metadata_and_preserves_dummy_query_flags():
 @pytest.mark.parametrize("with_pcp", [False, True])
 def test_executable_runtime_reuses_profile_state_and_buffer_addresses(monkeypatch, with_pcp):
     stage = SimpleNamespace(group_id=2, round_id=0, is_first=False, is_last=False)
-    plan = SimpleNamespace(plan_id="plan", local_stages=lambda _: [stage])
+    plan = SimpleNamespace(plan_id="plan", local_stages=lambda _: [stage], config=SimpleNamespace(enable_sas_metadata_reuse=False))
     model = object()
     state = SimpleNamespace()
     profile = sawtooth_runtime.SawtoothStageResources(
@@ -309,7 +309,7 @@ def test_executable_runtime_reuses_profile_state_and_buffer_addresses(monkeypatc
         model_state=SimpleNamespace(),
         sawtooth_profile_runtime=SimpleNamespace(plan=plan, stages={0: profile}),
         jit_warmup_registry=SimpleNamespace(activate=lambda: nullcontext()),
-        vllm_config=object(),
+        vllm_config=SimpleNamespace(parallel_config=SimpleNamespace()),
         device="cpu",
         kv_cache_config=object(),
         req_states=SimpleNamespace(req_id_to_index={}),

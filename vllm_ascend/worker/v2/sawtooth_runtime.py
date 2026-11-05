@@ -60,6 +60,14 @@ class SawtoothRunnerRuntime:
         self.plan = self.original_model.sawtooth_plan
         if self.plan is None:
             raise ValueError("Sawtooth stage runtime requires a model with a fixed stage plan")
+        parallel = runner.vllm_config.parallel_config
+        reuse = (
+            self.plan.config.enable_sas_metadata_reuse
+            and parallel.pipeline_parallel_size == 2
+            and parallel.prefill_context_parallel_size == 4
+            and parallel.tensor_parallel_size == 1
+        )
+        self.sas_metadata_caches = {} if reuse else None
         self.pp_rank = get_pp_group().rank_in_group
         self.stages: dict[int, SawtoothStageResources] = {}
         self._active_round: int | None = None

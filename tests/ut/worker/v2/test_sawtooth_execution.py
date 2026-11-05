@@ -204,3 +204,39 @@ def test_stage_payload_excludes_pcp_padding(local_tokens):
     result = execute_round(runner, output, None)
     expected = 10240 if local_tokens is None else local_tokens
     assert torch.equal(result["hidden_states"], payload[:expected])
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_sas_cache_survives_interleaving_and_retires_on_last_round_or_failure(fail):
+    runner = make_runner()
+    runner.pp_handler.allow_prefill_overlap = True
+    runner.req_states.req_id_to_index = {"r": 0}
+    runner.req_states.num_computed_tokens_np = np.zeros(1, dtype=np.int32)
+    runner.req_states.num_computed_prefill_tokens = np.zeros(1, dtype=np.int32)
+    runner.req_states.prefill_len = SimpleNamespace(np=np.array([20480]))
+    runner.req_states.num_computed_tokens = SimpleNamespace(gpu=torch.zeros(1, dtype=torch.int32))
+    runner.model_state = SimpleNamespace()
+    runner.sawtooth_runtime.activate = lambda _: nullcontext()
+    runner.sawtooth_runtime.sas_metadata_caches = {}
+    runner.sawtooth_runtime.plan = SimpleNamespace(config=SimpleNamespace(max_live_batches=2))
+    observed = []
+    def forward(output, intermediate):
+        observed.append(runner.model_state.sawtooth_sas_cache)
+        if fail and len(observed) == 3:
+            raise RuntimeError("forward failed")
+    runner.execute_model = forward
+    steps = [SawtoothRequestStep("r", 0, i, i * 10240, (i + 1) * 10240, False) for i in range(2)]
+    for seq, (batch, group) in enumerate([(0, 0), (1, 0), (0, 1), (1, 1)]):
+        output = make_output(scheduled={"r": 10240})
+        output.sawtooth_request_steps = {"r": steps[batch]}
+        output.sawtooth_execution = SawtoothExecution(batch, group, 2, seq, batch, 1, "p")
+        if fail and seq == 2:
+            with pytest.raises(RuntimeError, match="forward failed"):
+                execute_round(runner, output, None)
+            break
+        execute_round(runner, output, None)
+    assert observed[0] is not None
+    assert observed[0] is observed[2]
+    assert observed[0] is not observed[1]
+    assert not runner.sawtooth_runtime.sas_metadata_caches
+    assert runner.model_state.sawtooth_sas_cache is None

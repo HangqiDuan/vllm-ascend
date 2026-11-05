@@ -1065,6 +1065,17 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             )
             self.seq_lens = self.common_ratio_to_sas_metadata["seq_lens"]
 
+        shared_sas = kwargs.get("sawtooth_sas_cache", self.common_ratio_to_sas_metadata.get("sawtooth_sas_cache"))
+        if shared_sas is not None and not full_graph_mode and self.num_decodes == 0:
+            # CPU lengths are already computed by input preparation. Their values,
+            # not mutable tensor addresses, identify global versus PCP-local work.
+            signature = (
+                tuple(common_attn_metadata.query_start_loc_cpu[: num_reqs + 1].tolist()),
+                tuple(seq_lens_cpu[:num_reqs].tolist()),
+            )
+            self.common_ratio_to_sas_metadata["sawtooth_sas_scope"] = (shared_sas, signature)
+        else:
+            self.common_ratio_to_sas_metadata.pop("sawtooth_sas_scope", None)
         self.block_table = common_attn_metadata.block_table_tensor[:num_reqs]
         request_builder = (
             type(self).build_req_metadata

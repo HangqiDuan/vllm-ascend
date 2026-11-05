@@ -527,6 +527,11 @@ class AscendModelState(DefaultModelState):
             build_metadata = partial(self.device_metadata.run_build, build_attn_metadata)
         self._decoder_replay_common_metadata = {}
         self.attn_metadata = build_metadata(
+            sawtooth_sas_cache=(
+                getattr(self, "sawtooth_sas_cache", None)
+                if not for_capture and not input_batch.is_dummy and cudagraph_mode != CUDAGraphMode.FULL
+                else None
+            ),
             attn_groups=attn_groups,
             num_reqs=num_reqs,
             num_actual_reqs=num_actual_reqs,

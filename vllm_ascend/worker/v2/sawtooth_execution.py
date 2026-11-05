@@ -6,6 +6,8 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.worker.gpu.sawtooth import KeyedPPHandler
 
+from vllm_ascend.worker.v2.sawtooth_metadata import SawtoothSASCache
+
 
 def _admit(runner, output, batch_id):
     if not isinstance(runner.pp_handler, KeyedPPHandler):
@@ -18,6 +20,10 @@ def _admit(runner, output, batch_id):
     # when it is re-added in this same command. Consume its old dependency first.
     cleanup |= {data.req_id for data in output.scheduled_new_reqs if data.req_id in runner.pp_handler.current_steps}
     if cleanup:
+        caches = getattr(getattr(runner, "sawtooth_runtime", None), "sas_metadata_caches", None)
+        if caches is not None:
+            # Preemption/replacement invalidates retained immutable input versions.
+            caches.clear()
         runner.pp_handler.begin_batch(batch_id, cleanup, runner, {})
         runner.pp_handler.forget_requests(cleanup)
     runner.pp_handler.begin_batch(
@@ -87,9 +93,22 @@ def execute_round(runner, output, intermediate):
     runner.pp_handler.batch_id = execution.batch_id
     runtime = runner.sawtooth_runtime
     local_tokens = None
+    caches = getattr(runtime, "sas_metadata_caches", None)
+    cache_key = (execution.batch_id, tuple(sorted(steps.items())))
+    sas_cache = None
+    if caches is not None:
+        if execution.is_first_round:
+            # A strict bound also protects exceptional/cancelled admission paths.
+            limit = runtime.plan.config.max_live_batches or 2
+            if len(caches) >= limit:
+                caches.clear()
+            caches[cache_key] = SawtoothSASCache()
+        sas_cache = caches.get(cache_key)
     with runtime.activate(execution.round_id):
         runner._sawtooth_skip_lifecycle = True
         runner._sawtooth_active = True
+        if caches is not None:
+            runner.model_state.sawtooth_sas_cache = sas_cache
         try:
             result = runner.execute_model(output, intermediate)
             pcp_manager = getattr(runner, "pcp_manager", None)
@@ -98,7 +117,15 @@ def execute_round(runner, output, intermediate):
                     pcp_manager.global_batch.num_scheduled_tokens,
                     pcp_manager.global_batch.is_prefilling_np,
                 )
+        except BaseException:
+            if caches is not None:
+                caches.clear()
+            raise
         finally:
+            if caches is not None:
+                runner.model_state.sawtooth_sas_cache = None
+                if execution.is_last_round:
+                    caches.pop(cache_key, None)
             runner._sawtooth_skip_lifecycle = False
             runner._sawtooth_active = False
     if overlap:
