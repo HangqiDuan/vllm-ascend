@@ -179,3 +179,28 @@ def test_continuation_checks_immutable_input_version_before_forward(changed):
         with pytest.raises(RuntimeError, match="input version"):
             execute_round(runner, output, None)
         runner.execute_model.assert_not_called()
+
+
+@pytest.mark.parametrize("local_tokens", [None, 2560, 1046])
+def test_stage_payload_excludes_pcp_padding(local_tokens):
+    from vllm.sequence import IntermediateTensors
+
+    runner = make_runner()
+    step = SawtoothRequestStep("r", 0, 0, 0, 10240, False)
+    runner.req_states.req_id_to_index = {"r": 0}
+    runner.req_states.num_computed_tokens_np = [0]
+    runner.pp_handler.current_steps = {"r": step}
+    runner.sawtooth_runtime.activate = lambda _: nullcontext()
+    payload = torch.arange(10240).reshape(-1, 1)
+    runner.execute_model = Mock(return_value=IntermediateTensors({"hidden_states": payload}))
+    runner.pcp_manager = None if local_tokens is None else SimpleNamespace(
+        global_batch=SimpleNamespace(num_scheduled_tokens=np.array([10240]), is_prefilling_np=np.array([True])),
+        get_num_tokens_for_dispatch=lambda *args: local_tokens,
+    )
+    output = make_output(scheduled={"r": 10240})
+    output.total_num_scheduled_tokens = 10240
+    output.sawtooth_request_steps = {"r": step}
+    output.sawtooth_execution = SawtoothExecution(0, 1, 2, 1, 0, 1, "p")
+    result = execute_round(runner, output, None)
+    expected = 10240 if local_tokens is None else local_tokens
+    assert torch.equal(result["hidden_states"], payload[:expected])

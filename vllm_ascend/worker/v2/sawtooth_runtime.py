@@ -40,6 +40,7 @@ class SawtoothRunnerRuntime:
     """
 
     _RUNNER_FIELDS = (
+        "pcp_manager",
         "model",
         "model_state",
         "input_buffers",
@@ -51,8 +52,8 @@ class SawtoothRunnerRuntime:
     )
 
     def __init__(self, runner, cudagraph_mode, decode_query_len, lora_capture_cases=None, varlen_decode=False):
-        if runner.pcp_manager is not None or runner.ubatch_runner is not None:
-            raise ValueError("Sawtooth stage runtime does not yet support PCP or microbatch graph execution")
+        if runner.ubatch_runner is not None:
+            raise ValueError("Sawtooth stage runtime does not yet support microbatch graph execution")
         self.runner = runner
         self.original_model = runner.model
         self.base_model_state = runner.model_state
@@ -96,6 +97,17 @@ class SawtoothRunnerRuntime:
                 )
                 if not intermediate.tensors:
                     raise ValueError(f"Empty incoming carry schema for sawtooth group {stage.group_id}")
+            if runner.pcp_manager is not None:
+                from vllm.v1.worker.gpu.pcp_manager import maybe_build_pcp_manager
+
+                view.pcp_manager = maybe_build_pcp_manager(
+                    runner.vllm_config, runner.device, runner.supports_mm_inputs,
+                    runner.block_tables, cls=runner.pcp_manager_cls,
+                )
+                view.pcp_manager.vllm_config = runner.vllm_config
+                view.pcp_manager.kv_cache_config = runner.kv_cache_config
+                view.pcp_manager.global_input_buffers = input_buffers
+                view.model_state.pcp_manager = view.pcp_manager
             manager = SawtoothAclGraphManager(
                 runner.vllm_config,
                 runner.device,
@@ -175,6 +187,7 @@ class SawtoothRunnerRuntime:
         flags = ("dummy_num_tokens", "profile_cpp")
         previous_flags = {name: getattr(resource.input_buffers, name, missing) for name in flags}
         selected = {
+            "pcp_manager": getattr(resource.view, "pcp_manager", None),
             "model": resource.model,
             "model_state": resource.model_state,
             "input_buffers": resource.input_buffers,
@@ -226,10 +239,12 @@ class SawtoothRunnerRuntime:
             resource.manager._max_full_descs_to_capture = self._max_full_descs_to_capture
             resource.manager._capture_mem_samples = self._capture_mem_samples
             with self.activate(round_id):
+                pcp_manager = getattr(resource.view, "pcp_manager", None)
+                capture_inputs = pcp_manager.input_buffers if pcp_manager is not None else resource.input_buffers
                 resource.manager.capture(
                     resource.model,
                     resource.model_state,
-                    resource.input_buffers,
+                    capture_inputs,
                     resource.intermediate_tensors,
                     self.runner.block_tables,
                     resource.view.attn_groups,

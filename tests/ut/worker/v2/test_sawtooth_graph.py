@@ -200,7 +200,8 @@ def test_stage_attention_builders_are_new_and_preserve_kv_group_ids(monkeypatch)
     assert first[1][0].builder is not second[1][0].builder
 
 
-def test_stage_runtime_restores_runner_after_exception_and_rejects_nested_scope():
+@pytest.mark.parametrize("pcp", [None, object()])
+def test_stage_runtime_restores_runner_after_exception_and_rejects_nested_scope(pcp):
     runtime = object.__new__(sawtooth_runtime.SawtoothRunnerRuntime)
     fields = {name: object() for name in runtime._RUNNER_FIELDS}
     runner = SimpleNamespace(**fields, kv_cache_config=object(), req_states=SimpleNamespace(req_id_to_index={}))
@@ -210,7 +211,7 @@ def test_stage_runtime_restores_runner_after_exception_and_rejects_nested_scope(
     resource = sawtooth_runtime.SawtoothStageResources(
         stage,
         object(),
-        SimpleNamespace(model_state=state, attn_groups=[]),
+        SimpleNamespace(model_state=state, attn_groups=[], pcp_manager=pcp),
         object(),
         object(),
         manager,
@@ -224,6 +225,7 @@ def test_stage_runtime_restores_runner_after_exception_and_rejects_nested_scope(
     with pytest.raises(RuntimeError, match="model failure"), runtime.activate(1) as active:
         assert active is resource
         assert runner.model_state is state
+        assert runner.pcp_manager is pcp
         assert runner.cudagraph_manager is manager
         assert runner.is_first_pp_rank is False
         with pytest.raises(RuntimeError, match="cannot be nested"), runtime.activate(1):
@@ -282,7 +284,8 @@ def test_profile_scope_needs_no_kv_metadata_and_preserves_dummy_query_flags():
     assert inputs.profile_cpp is False
 
 
-def test_executable_runtime_reuses_profile_state_and_buffer_addresses(monkeypatch):
+@pytest.mark.parametrize("with_pcp", [False, True])
+def test_executable_runtime_reuses_profile_state_and_buffer_addresses(monkeypatch, with_pcp):
     stage = SimpleNamespace(group_id=2, round_id=0, is_first=False, is_last=False)
     plan = SimpleNamespace(plan_id="plan", local_stages=lambda _: [stage])
     model = object()
@@ -297,7 +300,10 @@ def test_executable_runtime_reuses_profile_state_and_buffer_addresses(monkeypatc
     )
     original = SimpleNamespace(sawtooth_plan=plan, get_sawtooth_stage=lambda _: model)
     runner = SimpleNamespace(
-        pcp_manager=None,
+        pcp_manager=object() if with_pcp else None,
+        supports_mm_inputs=False,
+        block_tables=object(),
+        pcp_manager_cls=object(),
         ubatch_runner=None,
         model=original,
         model_state=SimpleNamespace(),
@@ -316,8 +322,40 @@ def test_executable_runtime_reuses_profile_state_and_buffer_addresses(monkeypatc
     )
     monkeypatch.setattr(sawtooth_runtime, "SawtoothAclGraphManager", lambda *args, **kwargs: object())
     monkeypatch.setattr(sawtooth_runtime, "AscendInputBuffers", Mock(side_effect=AssertionError("reallocation")))
+    import vllm.v1.worker.gpu.pcp_manager as pcp_module
+
+    built_pcp = SimpleNamespace()
+    monkeypatch.setattr(pcp_module, "maybe_build_pcp_manager", lambda *a, **kw: built_pcp)
     runtime = sawtooth_runtime.SawtoothRunnerRuntime(runner, CUDAGraphMode.FULL, 1)
     resource = runtime.stages[0]
     assert resource.model_state is state
     assert resource.input_buffers is profile.input_buffers
     assert resource.intermediate_tensors is profile.intermediate_tensors
+
+    if with_pcp:
+        assert resource.view.pcp_manager is built_pcp
+        assert resource.model_state.pcp_manager is built_pcp
+        assert built_pcp is not runner.pcp_manager
+        assert built_pcp.global_input_buffers is resource.input_buffers
+        assert built_pcp.kv_cache_config is runner.kv_cache_config
+
+
+@pytest.mark.parametrize("with_pcp", [False, True])
+def test_stage_capture_uses_replay_input_buffers(with_pcp):
+    runtime = object.__new__(sawtooth_runtime.SawtoothRunnerRuntime)
+    global_inputs, local_inputs = object(), object()
+    capture = Mock()
+    resource = SimpleNamespace(
+        model=object(), model_state=object(), input_buffers=global_inputs,
+        intermediate_tensors=object(),
+        view=SimpleNamespace(attn_groups=[], pcp_manager=SimpleNamespace(input_buffers=local_inputs) if with_pcp else None),
+        manager=SimpleNamespace(capture=capture),
+    )
+    runtime.__dict__.update(
+        original_model=object(), stages={0: resource},
+        runner=SimpleNamespace(block_tables=object(), kv_cache_config=object()),
+        _max_full_descs_to_capture=None, _capture_mem_samples=None,
+        refresh_shared_state=lambda: None, activate=lambda _: nullcontext(),
+    )
+    runtime.capture(runtime.original_model)
+    assert capture.call_args.args[2] is (local_inputs if with_pcp else global_inputs)
