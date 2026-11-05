@@ -433,3 +433,41 @@ def test_pcp_transport_uses_largest_rank_local_extent(query, expected, cached):
         output.total_num_scheduled_tokens = 1
         output.sawtooth_request_steps["r"].token_start = query * 2
         assert sawtooth_transport.pcp_transport_num_tokens(output, runner) == 1
+
+
+@pytest.mark.parametrize("wire_sharded", [False, True])
+def test_receive_wait_follows_preparation_and_precedes_activation_read(monkeypatch, wire_sharded):
+    events = []
+    stream = Stream()
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(
+        Event=Event, current_stream=lambda device: stream), raising=False)
+    plan = StagePlan.build(SawtoothConfig(True, 2), 4, 2)
+    transport = make_transport(plan, 1)
+    cmd = command(plan, 0, 0, 0)
+    tensor = torch.ones(3, 1)
+    wire = tensor[:1] if wire_sharded else tensor
+    transfer = sawtooth_transport._Transfer(cmd, {"hidden": tensor}, {"hidden": wire},
+        [SimpleNamespace(wait=lambda: events.append("recv_wait"))])
+    monkeypatch.setattr(transport, "_post_receive", lambda *_args: transfer)
+    monkeypatch.setattr(transport, "_send", lambda *_args: events.append("send"))
+    if wire_sharded:
+        transport.tp = object()
+        def gather(wire, group, output):
+            events.append("gather")
+            return output, SimpleNamespace(wait=lambda: events.append("gather_wait"))
+        monkeypatch.setattr(sawtooth_transport, "all_gather_async", gather)
+    def execute(scheduled, incoming):
+        assert events == []
+        events.append("prepare")
+        assert incoming.tensors["hidden"] is tensor
+        events.append("copy")
+        # A second tensor lookup must not repeat waits or collectives.
+        assert incoming.tensors["hidden"] is tensor
+        return IntermediateTensors({"hidden": tensor})
+    transport.execute_round(SimpleNamespace(sawtooth_execution=cmd,
+        total_num_scheduled_tokens=3), SimpleNamespace(execute_sawtooth_round=execute))
+    expected = ["prepare", "recv_wait"]
+    if wire_sharded:
+        expected += ["gather", "gather_wait"]
+    assert events == expected + ["copy", "send"]
+    assert transfer.consumer_done is not None

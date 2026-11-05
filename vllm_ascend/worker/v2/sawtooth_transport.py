@@ -326,7 +326,17 @@ class SawtoothTransport:
                         raise ValueError("Wrap receive does not match the continuation")
             else:
                 incoming = self._post_receive(command, command.round_id, num_tokens, "ordinary")
-        intermediate = None if incoming is None else self._consume(incoming)
+        intermediate = None
+        if incoming is not None:
+            # Match native PP: prepare KV/metadata while receive is in flight.
+            # The first activation read inserts receive/gather dependencies on
+            # the compute stream; posting and buffer lease order stay unchanged.
+            from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
+
+            intermediate = AsyncIntermediateTensors(
+                incoming.tensors,
+                comm_postprocess=[lambda: self._consume(incoming)],
+            )
         output = runner.execute_sawtooth_round(scheduler_output, intermediate)
         if incoming is not None:
             incoming.consumer_done = torch.npu.Event()
