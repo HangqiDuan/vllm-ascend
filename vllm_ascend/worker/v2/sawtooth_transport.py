@@ -11,6 +11,7 @@ each other or the sampled-token communicator.
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
 import torch
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.distributed.sawtooth import get_sawtooth_plan
@@ -90,6 +91,28 @@ def _validate_nonblocking_hccl() -> None:
         value = envs.HCCL_BLOCKING_WAIT
     if value not in (None, "0"):
         raise ValueError("Sawtooth requires nonblocking HCCL Work.wait; set TORCH_HCCL_BLOCKING_WAIT=0")
+
+
+def pcp_transport_num_tokens(output, runner):
+    """Match PCP dispatch's local extent before posting a stage receive."""
+    manager = getattr(runner, "pcp_manager", None)
+    if manager is None or not output.total_num_scheduled_tokens:
+        return output.total_num_scheduled_tokens
+    new_lengths = {
+        data.req_id: len(data.prompt_token_ids)
+        for data in output.scheduled_new_reqs
+    }
+    counts, prefilling = [], []
+    for rid, count in output.num_scheduled_tokens.items():
+        prompt_len = new_lengths.get(rid)
+        if prompt_len is None:
+            index = runner.req_states.req_id_to_index[rid]
+            prompt_len = runner.req_states.prefill_len.np[index]
+        counts.append(count)
+        prefilling.append(output.sawtooth_request_steps[rid].token_start < prompt_len)
+    return manager.get_num_tokens_for_dispatch(
+        np.asarray(counts, dtype=np.int32), np.asarray(prefilling, dtype=np.bool_)
+    )
 
 
 class SawtoothTransport:
@@ -286,7 +309,7 @@ class SawtoothTransport:
         command = scheduler_output.sawtooth_execution
         if not isinstance(command, SawtoothExecution):
             raise TypeError("Sawtooth execution requires a typed round command")
-        num_tokens = scheduler_output.total_num_scheduled_tokens
+        num_tokens = pcp_transport_num_tokens(scheduler_output, runner)
         if not 0 <= num_tokens <= self.max_tokens:
             raise ValueError("Sawtooth token count exceeds its reserved buffers")
         self.ledger.accept(command)

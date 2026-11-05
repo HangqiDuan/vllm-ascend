@@ -400,3 +400,36 @@ def test_startup_visits_matching_p2p_edges_before_early_receives(monkeypatch, pi
             (pipeline_size - 1, 0, "wrap"),
         }
     )
+
+
+@pytest.mark.parametrize("query,expected", [(10240, 2560), (5120, 1280), (4179, 1046), (1, 1), (7, 2)])
+@pytest.mark.parametrize("cached", [False, True])
+def test_pcp_transport_uses_largest_rank_local_extent(query, expected, cached):
+    from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
+
+    manager = object.__new__(AscendPCPManager)
+    manager.pcp_world_size = 4
+    manager.dcp_world_size = 1
+    manager.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(prefill_context_parallel_size=4, decode_context_parallel_size=1))
+    # Pure prefill uses the inherited DualChunkSwap partition policy.
+    output = SimpleNamespace(
+        total_num_scheduled_tokens=query,
+        num_scheduled_tokens={"r": query},
+        scheduled_new_reqs=[SimpleNamespace(req_id="r", prompt_token_ids=list(range(query)))],
+        sawtooth_request_steps={"r": SimpleNamespace(token_start=0)},
+    )
+    runner = SimpleNamespace(
+        pcp_manager=manager,
+        req_states=SimpleNamespace(
+            req_id_to_index={"r": 0}, prefill_len=SimpleNamespace(np=[query * 2]),
+        ),
+    )
+    if cached:
+        output.scheduled_new_reqs = []
+        output.sawtooth_request_steps["r"].token_start = query
+    assert sawtooth_transport.pcp_transport_num_tokens(output, runner) == expected
+    if cached:
+        output.num_scheduled_tokens = {"r": 1}
+        output.total_num_scheduled_tokens = 1
+        output.sawtooth_request_steps["r"].token_start = query * 2
+        assert sawtooth_transport.pcp_transport_num_tokens(output, runner) == 1

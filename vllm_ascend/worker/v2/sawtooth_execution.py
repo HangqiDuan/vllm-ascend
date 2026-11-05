@@ -86,11 +86,18 @@ def execute_round(runner, output, intermediate):
             runner.req_states.num_computed_tokens.gpu[index].fill_(step.token_start)
     runner.pp_handler.batch_id = execution.batch_id
     runtime = runner.sawtooth_runtime
+    local_tokens = None
     with runtime.activate(execution.round_id):
         runner._sawtooth_skip_lifecycle = True
         runner._sawtooth_active = True
         try:
             result = runner.execute_model(output, intermediate)
+            pcp_manager = getattr(runner, "pcp_manager", None)
+            if isinstance(result, IntermediateTensors) and pcp_manager is not None:
+                local_tokens = pcp_manager.get_num_tokens_for_dispatch(
+                    pcp_manager.global_batch.num_scheduled_tokens,
+                    pcp_manager.global_batch.is_prefilling_np,
+                )
         finally:
             runner._sawtooth_skip_lifecycle = False
             runner._sawtooth_active = False
@@ -99,7 +106,7 @@ def execute_round(runner, output, intermediate):
     if execution.is_last_round:
         runner.pp_handler.sample_steps = steps
     if isinstance(result, IntermediateTensors):
-        num_tokens = output.total_num_scheduled_tokens
+        num_tokens = local_tokens if local_tokens is not None else output.total_num_scheduled_tokens
         return IntermediateTensors({name: value[:num_tokens] for name, value in result.tensors.items()})
     return result
 
