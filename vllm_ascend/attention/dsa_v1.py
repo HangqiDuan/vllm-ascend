@@ -920,6 +920,17 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 )
             self.slot_mapping[:num_input_tokens].copy_(formatted_slots[:num_input_tokens])
 
+        shared_sas = kwargs.get("sawtooth_sas_cache", self.common_ratio_to_sas_metadata.get("sawtooth_sas_cache"))
+        if shared_sas is not None and not full_graph_mode and self.num_decodes == 0:
+            # CPU lengths are already computed by input preparation. Their values,
+            # not mutable tensor addresses, identify global versus PCP-local work.
+            signature = (
+                tuple(common_attn_metadata.query_start_loc_cpu[: num_reqs + 1].tolist()),
+                tuple(seq_lens_cpu[:num_reqs].tolist()),
+            )
+            self.common_ratio_to_sas_metadata["sawtooth_sas_scope"] = (shared_sas, signature)
+        else:
+            self.common_ratio_to_sas_metadata.pop("sawtooth_sas_scope", None)
         self.block_table = common_attn_metadata.block_table_tensor[:num_reqs]
         req_metadata = self.build_req_metadata(
             common_attn_metadata=common_attn_metadata,
@@ -980,7 +991,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             if dspark_swa:
                 query_lens = query_start_loc[1:] - query_start_loc[:-1]
                 sas_seq_lens = torch.minimum(seq_lens, query_lens + self.model_config.hf_config.sliding_window)
-            sas_metadata = metadata_op(
+            sas_kwargs = dict(
                 **metadata_kwargs,
                 num_heads_q=n_local_heads,
                 num_heads_kv=1,
@@ -1004,6 +1015,26 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 has_ori_kv=True,
                 has_cmp_kv=self.compressor_ratio > 1,
             )
+            scope = metadata_cache.get("sawtooth_sas_scope")
+            if (
+                scope is not None
+                and not dspark_swa
+                and self.seqused_q.numel() == 0
+                and cu_seqlens_ori_kv is query_start_loc
+                and cu_seqlens_cmp_kv is None
+                and not isinstance(max_seqlen_q, torch.Tensor)
+                and not isinstance(max_seqlen_kv, torch.Tensor)
+            ):
+                cache, signature = scope
+                # Prefill tensors are functions of the CPU lengths above. Include
+                # every scalar option and tensor dtype/shape in the compatibility key.
+                options = tuple(
+                    (name, (str(value.dtype), tuple(value.shape)) if isinstance(value, torch.Tensor) else value)
+                    for name, value in sorted(sas_kwargs.items())
+                )
+                sas_metadata = cache.get_or_build((signature, options), lambda: metadata_op(**sas_kwargs))
+            else:
+                sas_metadata = metadata_op(**sas_kwargs)
             metadata_cache[layer_name] = sas_metadata
 
         self.sas_metadata_buffer[:DSA_METADATA_BUFFER_SIZE] = sas_metadata

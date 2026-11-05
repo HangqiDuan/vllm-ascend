@@ -2507,6 +2507,7 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
                 fast_build,
                 num_actual_reqs=pcp_context.global_batch.num_reqs,
                 common_ratio_to_sas_metadata={},
+                sawtooth_sas_cache=kwargs.get("sawtooth_sas_cache"),
                 can_use_rope_cache=False,
                 full_graph_mode=full_graph_mode,
             )
@@ -2534,6 +2535,7 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
             local_common_attn_metadata,
             num_actual_reqs,
         )
+        common_ratio_to_sas_metadata["sawtooth_sas_cache"] = kwargs.get("sawtooth_sas_cache")
         local_dsa_metadata = self._build_local_dsa_metadata(
             common_prefix_len,
             local_common_attn_metadata,

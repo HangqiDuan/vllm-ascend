@@ -2951,3 +2951,41 @@ def test_dspark_compressed_tq_metadata_keeps_full_context(use_tq, ratio, deferre
     assert metadata_op.call_args.kwargs["seqused_kv"].tolist() == [261 if compressed_tq else 133]
     assert (metadata.dspark_swa_indices is None) == compressed_tq
     assert metadata.ori_win_left == (127 if compressed_tq else 132)
+
+
+@pytest.mark.parametrize("changed", ["query", "seq", "window", "topk", "dynamic_q"])
+def test_sawtooth_sas_reuses_equivalent_builders_but_recomputes_changed_inputs(changed):
+    from vllm_ascend.worker.v2.sawtooth_metadata import SawtoothSASCache
+    shared = SawtoothSASCache()
+    first, later = _make_builder(4), _make_builder(4)
+    count = []
+    def metadata_op(**kw):
+        count.append(kw)
+        return torch.full((DSA_METADATA_BUFFER_SIZE,), len(count), dtype=torch.int32)
+    plan = _mock_dsa_kv_plan(get_dsa_sparse_attn_metadata_op=metadata_op, get_dsa_sparse_attn_metadata_kwargs={})
+    def build(builder, q=8, seq=16, window=127):
+        offsets = torch.tensor([0, q], dtype=torch.int32)
+        local_cache = {"sawtooth_sas_scope": (shared, ((0, q), (seq,)))}
+        return builder._build_sas_metadata(
+            metadata_cache=local_cache, layer_name="c4", query_start_loc=offsets,
+            seq_lens=torch.tensor([seq], dtype=torch.int32), max_seqlen_q=q,
+            max_seqlen_kv=seq, cu_seqlens_ori_kv=offsets, cu_seqlens_cmp_kv=None,
+            ori_win_left=window, ori_win_right=0, dspark_swa=False,
+        ).clone()
+    with patch("vllm_ascend.attention.dsa_v1.get_dsa_attn_kv_plan", return_value=plan), patch(
+        "vllm_ascend.attention.dsa_v1.get_tensor_model_parallel_world_size", return_value=1
+    ):
+        assert build(first)[0].item() == 1
+        assert build(later)[0].item() == 1
+        if changed == "query": result = build(later, q=4)
+        elif changed == "seq": result = build(later, seq=20)
+        elif changed == "window": result = build(later, window=63)
+        elif changed == "topk":
+            later.model_config.hf_config.index_topk += 1
+            result = build(later)
+        else:
+            later.seqused_q = torch.tensor([8], dtype=torch.int32)
+            build(later)
+            later.seqused_q.fill_(4)
+            result = build(later)
+        assert result[0].item() == (3 if changed == "dynamic_q" else 2)
