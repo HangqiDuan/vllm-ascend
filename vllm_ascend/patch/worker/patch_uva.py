@@ -78,6 +78,19 @@ def get_row_indices_from_key(key: int | slice | tuple, dim_size: int) -> set[int
         return set(range(dim_size))
 
 
+def _notify_modified_rows(key, dim_size, callback, prefix_callback):
+    row_key = key[0] if isinstance(key, tuple) and key else key
+    if prefix_callback is not None and isinstance(row_key, slice):
+        start, stop, step = row_key.indices(dim_size)
+        if start == 0 and step == 1:
+            # Buffer pools write a contiguous prefix. Record its endpoint,
+            # rather than calling Python once per prompt token.
+            prefix_callback(stop)
+            return
+    for row in get_row_indices_from_key(key, dim_size):
+        callback(row)
+
+
 class MonitoredNumPyArray:
     """A wrapper around a NumPy array that monitors modifications."""
 
