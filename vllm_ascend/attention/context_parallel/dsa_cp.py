@@ -143,7 +143,8 @@ class AscendDSAPCPMetadataBuilder(AscendDSAMetadataBuilder):
         # Use the preallocated buffer to keep the address fixed for graph replay.
         hidden_restore_idx = self._hidden_restore_idx_buffer[:num_restore_tokens]
         hidden_restore_idx[:num_actual_tokens].copy_(pcp_context.hidden_restore_idx[:num_actual_tokens])
-        hidden_restore_idx[num_actual_tokens:].zero_()
+        if num_actual_tokens < num_restore_tokens:
+            hidden_restore_idx[num_actual_tokens:].zero_()
 
         # The upstream dummy path only invalidates gathered slot mappings.
         # DSA also consumes the scheduler-global mapping, so clear it here.
@@ -303,7 +304,9 @@ class AscendDSAPCPMetadataBuilder(AscendDSAMetadataBuilder):
         # PCP only supplies the local layout and whether it owns cache writes.
         # A captured graph still runs its padded queries, so their metadata
         # must be refreshed even when this rank owns no tokens.
-        if local_common_attn_metadata.query_start_loc_cpu[-1] > 0:
+        # This offset is already on CPU; compare its scalar without creating
+        # a temporary boolean Tensor for every metadata builder.
+        if local_common_attn_metadata.query_start_loc_cpu[-1].item() > 0:
             return super().build(
                 common_prefix_len,
                 local_common_attn_metadata,

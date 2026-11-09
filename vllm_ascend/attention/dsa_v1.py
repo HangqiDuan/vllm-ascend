@@ -1067,12 +1067,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
 
         shared_sas = kwargs.get("sawtooth_sas_cache", self.common_ratio_to_sas_metadata.get("sawtooth_sas_cache"))
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu
-        if (
-            shared_sas is not None
-            and seq_lens_cpu is not None
-            and not full_graph_mode
-            and self.num_decodes == 0
-        ):
+        if shared_sas is not None and seq_lens_cpu is not None and not full_graph_mode and self.num_decodes == 0:
             # CPU lengths are already computed by input preparation. Their values,
             # not mutable tensor addresses, identify global versus PCP-local work.
             signature = (
@@ -1354,7 +1349,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         assert self.num_actual_tokens is not None
         num_reqs = common.num_reqs
         actual_reqs = num_reqs if num_actual_reqs is None else min(num_actual_reqs, num_reqs)
-        self.block_table[actual_reqs:num_reqs].zero_()
+        if actual_reqs < num_reqs:
+            self.block_table[actual_reqs:num_reqs].zero_()
         self._device_metadata_tasks = ()
         return AscendDSAReqMetadata(
             block_table=self.block_table[:num_reqs],

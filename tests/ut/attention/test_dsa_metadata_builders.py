@@ -7,6 +7,7 @@ from unittest import TestCase
 from unittest.mock import Mock, patch
 
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from vllm_ascend.attention import dsa_v1
 from vllm_ascend.attention.context_parallel import dsa_cp
@@ -90,6 +91,7 @@ class TestDSAMetadataBuilders(TestCase):
             query_start_loc_cpu=torch.tensor([0, 2], dtype=torch.int32),
             seq_lens=self.builder.seq_lens,
             _seq_lens_cpu=self.builder.seq_lens,
+            seq_lens_cpu=self.builder.seq_lens,
             block_table_tensor=self.builder.block_table,
             slot_mapping=torch.tensor([12, 13], dtype=torch.int32),
             positions=torch.tensor([4, 5]),
@@ -635,7 +637,7 @@ class TestDSAMetadataBuilders(TestCase):
         self.assertIsNotNone(result.global_dsa_metadata.req_metadata.start_pos)
         self.assertIs(builder.common_ratio_to_sas_metadata, shared)
         self.assertNotIn("req_preamble", shared["pcp_global"])
-        self.assertEqual(shared["pcp_local"], {})
+        self.assertEqual(shared["pcp_local"], {"sawtooth_sas_cache": None})
         for offsets in shared["pcp_local_offsets"]:
             torch.testing.assert_close(offsets, torch.tensor([0, 0], dtype=torch.int32))
 
@@ -681,3 +683,26 @@ class TestDSAMetadataBuilders(TestCase):
             self.assertIs(global_call.args[1].block_table_tensor, context.global_block_tables[index])
             self.assertTrue(global_call.kwargs["build_query"])
             self.assertTrue(local_call.kwargs["update_cache"])
+
+
+class TestMetadataPaddingWrites(TestCase):
+    def test_unpadded_request_skips_empty_zero_dispatch(self):
+        class RecordEmptyZero(TorchDispatchMode):
+            def __init__(self):
+                self.empty_zero_calls = 0
+
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                if func is torch.ops.aten.zero_.default and args[0].numel() == 0:
+                    self.empty_zero_calls += 1
+                return func(*args, **(kwargs or {}))
+
+        for actual in (0, 1, None):
+            builder = make_builder(dsa_v1.AscendDSASWAMetadataBuilder)
+            common = CommonMetadata(num_reqs=1, query_start_loc=torch.tensor([0, 1]))
+            before = builder.block_table.clone()
+            mode = RecordEmptyZero()
+            with mode:
+                req = builder._new_req_metadata(common, actual)
+            assert req.block_table.data_ptr() == builder.block_table.data_ptr()
+            assert torch.equal(req.block_table, torch.zeros_like(before) if actual == 0 else before)
+            assert mode.empty_zero_calls == 0

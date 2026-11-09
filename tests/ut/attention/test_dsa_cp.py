@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from vllm_ascend.attention.context_parallel import dsa_cp
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSAPCPImpl, AscendDSAPCPMetadataBuilder
@@ -126,3 +127,54 @@ class TestAscendDSAPCPGraphPadding:
         assert rotary.call_args.args[2] is sin
         scatter.assert_called_once()
         assert scatter.call_args.args[2] is slot_mapping
+
+
+@pytest.mark.parametrize("actual,padded", [(4, 4), (2, 4), (0, 4)])
+def test_restore_indices_skips_empty_zero_dispatch(actual, padded):
+    class RecordEmptyZero(TorchDispatchMode):
+        def __init__(self):
+            self.empty_zero_calls = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if func is torch.ops.aten.zero_.default and args[0].numel() == 0:
+                self.empty_zero_calls += 1
+            return func(*args, **(kwargs or {}))
+
+    builder = AscendDSAPCPMetadataBuilder.__new__(AscendDSAPCPMetadataBuilder)
+    builder._hidden_restore_idx_buffer = torch.full((8,), -1, dtype=torch.int64)
+    indices = torch.arange(10, 10 + actual, dtype=torch.int64)
+    context = AscendPCPAttentionContext(
+        global_batch=SimpleNamespace(num_tokens=actual, num_tokens_after_padding=padded, is_dummy=False),
+        global_block_tables=(),
+        global_slot_mappings=torch.zeros(0, dtype=torch.int64),
+        hidden_restore_idx=indices,
+    )
+    mode = RecordEmptyZero()
+    with mode:
+        prepared = builder._prepare_graph_pcp_context(context, full_graph_mode=True)
+    assert torch.equal(prepared.hidden_restore_idx[:actual], indices)
+    assert torch.count_nonzero(prepared.hidden_restore_idx[actual:]) == 0
+    assert mode.empty_zero_calls == 0
+
+
+@pytest.mark.parametrize("offsets,expected", [([0, 0], False), ([0, 1, 2], True)])
+def test_local_metadata_gate_without_tensor_comparison(offsets, expected):
+    class RecordComparisons(TorchDispatchMode):
+        def __init__(self):
+            self.comparisons = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if func is torch.ops.aten.gt.Scalar:
+                self.comparisons += 1
+            return func(*args, **(kwargs or {}))
+
+    builder = AscendDSAPCPMetadataBuilder.__new__(AscendDSAPCPMetadataBuilder)
+    builder.model_config = SimpleNamespace(get_head_size=lambda: 8)
+    builder._global_metadata_builder = SimpleNamespace(hadamard=None)
+    builder.metadata_cls = SimpleNamespace
+    common = SimpleNamespace(query_start_loc_cpu=torch.tensor(offsets), attn_state=None)
+    mode = RecordComparisons()
+    with patch.object(dsa_cp.dsa_v1.AscendDSAMetadataBuilder, "build") as build, mode:
+        builder._build_local_dsa_metadata(0, common, False, 0, {}, full_graph_mode=True)
+    assert build.called == expected
+    assert mode.comparisons == 0
