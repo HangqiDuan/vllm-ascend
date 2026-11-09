@@ -257,6 +257,7 @@ class SawtoothRunnerRuntime:
                     self.runner.block_tables,
                     resource.view.attn_groups,
                     self.runner.kv_cache_config,
+                    pcp_manager=pcp_manager,
                     **capture_options,
                 )
 

@@ -359,3 +359,4 @@ def test_stage_capture_uses_replay_input_buffers(with_pcp):
     )
     runtime.capture(runtime.original_model)
     assert capture.call_args.args[2] is (local_inputs if with_pcp else global_inputs)
+    assert capture.call_args.kwargs["pcp_manager"] is resource.view.pcp_manager
