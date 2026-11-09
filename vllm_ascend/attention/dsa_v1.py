@@ -1066,7 +1066,13 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             self.seq_lens = self.common_ratio_to_sas_metadata["seq_lens"]
 
         shared_sas = kwargs.get("sawtooth_sas_cache", self.common_ratio_to_sas_metadata.get("sawtooth_sas_cache"))
-        if shared_sas is not None and not full_graph_mode and self.num_decodes == 0:
+        seq_lens_cpu = common_attn_metadata.seq_lens_cpu
+        if (
+            shared_sas is not None
+            and seq_lens_cpu is not None
+            and not full_graph_mode
+            and self.num_decodes == 0
+        ):
             # CPU lengths are already computed by input preparation. Their values,
             # not mutable tensor addresses, identify global versus PCP-local work.
             signature = (
@@ -1840,7 +1846,7 @@ class AscendDSAAttentionMetadataBuilder(AscendDSAMetadataBuilder):
             if dspark_swa:
                 query_lens = query_start_loc[1:] - query_start_loc[:-1]
                 sas_seq_lens = torch.minimum(seq_lens, query_lens + self.model_config.hf_config.sliding_window)
-            sas_metadata = metadata_op(
+            sas_kwargs = dict(
                 **metadata_kwargs,
                 num_heads_q=n_local_heads,
                 num_heads_kv=1,
@@ -1864,6 +1870,24 @@ class AscendDSAAttentionMetadataBuilder(AscendDSAMetadataBuilder):
                 has_ori_kv=True,
                 has_cmp_kv=self.compressor_ratio > 1,
             )
+            scope = metadata_cache.get("sawtooth_sas_scope")
+            if (
+                scope is not None
+                and not dspark_swa
+                and self.seqused_q.numel() == 0
+                and cu_seqlens_ori_kv is query_start_loc
+                and cu_seqlens_cmp_kv is None
+                and not isinstance(max_seqlen_q, torch.Tensor)
+                and not isinstance(max_seqlen_kv, torch.Tensor)
+            ):
+                cache, signature = scope
+                options = tuple(
+                    (name, (str(value.dtype), tuple(value.shape)) if isinstance(value, torch.Tensor) else value)
+                    for name, value in sorted(sas_kwargs.items())
+                )
+                sas_metadata = cache.get_or_build((signature, options), lambda: metadata_op(**sas_kwargs))
+            else:
+                sas_metadata = metadata_op(**sas_kwargs)
             metadata_cache[key] = sas_metadata
 
         output = self.sas_metadata_buffer

@@ -31,6 +31,7 @@ from vllm_ascend.attention.context_parallel.dsa_cp import (
 )
 from vllm_ascend.attention.dsa_v1 import (
     DSA_METADATA_BUFFER_SIZE,
+    AscendDSAAttentionMetadataBuilder,
     AscendDSABackend,
     AscendDSAImpl,
     AscendDSALayerMetadata,
@@ -3096,8 +3097,9 @@ def test_sparse_flash_forward_requires_draft_metadata(is_draft):
         assert "ori_topk_length" not in kwargs
 
 
+@pytest.mark.parametrize("implementation", [AscendDSAMetadataBuilder, AscendDSAAttentionMetadataBuilder])
 @pytest.mark.parametrize("changed", ["query", "seq", "window", "topk", "dynamic_q"])
-def test_sawtooth_sas_reuses_equivalent_builders_but_recomputes_changed_inputs(changed):
+def test_sawtooth_sas_reuses_equivalent_builders_but_recomputes_changed_inputs(changed, implementation):
     from vllm_ascend.worker.v2.sawtooth_metadata import SawtoothSASCache
     shared = SawtoothSASCache()
     first, later = _make_builder(4), _make_builder(4)
@@ -3109,8 +3111,8 @@ def test_sawtooth_sas_reuses_equivalent_builders_but_recomputes_changed_inputs(c
     def build(builder, q=8, seq=16, window=127):
         offsets = torch.tensor([0, q], dtype=torch.int32)
         local_cache = {"sawtooth_sas_scope": (shared, ((0, q), (seq,)))}
-        return builder._build_sas_metadata(
-            metadata_cache=local_cache, layer_name="c4", query_start_loc=offsets,
+        return implementation._build_sas_metadata(
+            builder, metadata_cache=local_cache, layer_name="c4", query_start_loc=offsets,
             seq_lens=torch.tensor([seq], dtype=torch.int32), max_seqlen_q=q,
             max_seqlen_kv=seq, cu_seqlens_ori_kv=offsets, cu_seqlens_cmp_kv=None,
             ori_win_left=window, ori_win_right=0, dspark_swa=False,
@@ -3120,9 +3122,12 @@ def test_sawtooth_sas_reuses_equivalent_builders_but_recomputes_changed_inputs(c
     ):
         assert build(first)[0].item() == 1
         assert build(later)[0].item() == 1
-        if changed == "query": result = build(later, q=4)
-        elif changed == "seq": result = build(later, seq=20)
-        elif changed == "window": result = build(later, window=63)
+        if changed == "query":
+            result = build(later, q=4)
+        elif changed == "seq":
+            result = build(later, seq=20)
+        elif changed == "window":
+            result = build(later, window=63)
         elif changed == "topk":
             later.model_config.hf_config.index_topk += 1
             result = build(later)

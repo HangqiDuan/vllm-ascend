@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 import torch
 
-from vllm_ascend.patch.worker.patch_v2.patch_uva import UvaBufferWrapper
+from vllm_ascend.patch.worker.patch_uva import UvaBufferWrapper
 
 
 def cpu_buffer(shape):
@@ -18,7 +18,7 @@ def cpu_buffer(shape):
     buf._uva = torch.full(shape, -1, dtype=torch.int32)
     buf._use_real_uva = False
     buf._modified_indices = set()
-    buf._modified_prefix_len = 0
+    buf._dirty_prefix_end = 0
     return buf
 
 
@@ -37,7 +37,7 @@ def test_long_prefix_does_not_visit_every_row(view):
     actual = buf.uva()
     assert torch.equal(actual[:131155], torch.arange(131155, dtype=torch.int32))
     assert (actual[131155:] == -1).all()
-    assert not buf._modified_indices and buf._modified_prefix_len == 0
+    assert not buf._modified_indices and buf._dirty_prefix_end == 0
     # A second read without a tracked write must not re-copy the host buffer.
     buf._cpu[0] = -7
     assert buf.uva()[0] == 0
@@ -82,23 +82,25 @@ def test_prefix_and_noncontiguous_rows_preserve_clean_rows(view):
         patch.object(torch.Tensor, "to", to_cpu),
     ):
         assert torch.equal(buf.uva(), expected)
-    assert not buf._modified_indices and buf._modified_prefix_len == 0
+    assert not buf._modified_indices and buf._dirty_prefix_end == 0
 
 
 def test_failed_copy_keeps_dirty_state_for_retry():
     buf = cpu_buffer((8, 2))
     buf.np[:4] = 7
     buf.np[4] = 9
-    with patch.object(torch.Tensor, "copy_", side_effect=RuntimeError("copy failed")):
-        with pytest.raises(RuntimeError, match="copy failed"):
-            buf.uva()
-    assert buf._modified_prefix_len == 4
+    with (
+        patch.object(torch.Tensor, "copy_", side_effect=RuntimeError("copy failed")),
+        pytest.raises(RuntimeError, match="copy failed"),
+    ):
+        buf.uva()
+    assert buf._dirty_prefix_end == 4
     assert buf._modified_indices == {4}
     expected = torch.full((8, 2), -1, dtype=torch.int32)
     expected[:4] = 7
     expected[4] = 9
     assert torch.equal(buf.uva(), expected)
-    assert not buf._modified_indices and buf._modified_prefix_len == 0
+    assert not buf._modified_indices and buf._dirty_prefix_end == 0
 
 
 @pytest.mark.parametrize("view", ["np", "cpu"])
@@ -114,4 +116,4 @@ def test_empty_partial_column_and_failed_writes(view):
     assert (actual[4:] == -1).all()
     with pytest.raises((IndexError, RuntimeError, ValueError)):
         dst[100] = 2
-    assert not buf._modified_indices and buf._modified_prefix_len == 0
+    assert not buf._modified_indices and buf._dirty_prefix_end == 0
