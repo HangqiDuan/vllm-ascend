@@ -19,6 +19,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -1067,13 +1068,22 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
 
         shared_sas = kwargs.get("sawtooth_sas_cache", self.common_ratio_to_sas_metadata.get("sawtooth_sas_cache"))
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu
-        if shared_sas is not None and seq_lens_cpu is not None and not full_graph_mode and self.num_decodes == 0:
+        decode_signature = getattr(shared_sas, "decode_signature", None)
+        reuse_decode = decode_signature is not None and self.num_prefills == 0 and self.speculative_config is None
+        self.common_ratio_to_sas_metadata["sawtooth_sas_decode"] = reuse_decode
+        if (
+            shared_sas is not None
+            and seq_lens_cpu is not None
+            and (reuse_decode or (not full_graph_mode and self.num_decodes == 0))
+        ):
             # CPU lengths are already computed by input preparation. Their values,
             # not mutable tensor addresses, identify global versus PCP-local work.
             signature = (
                 tuple(common_attn_metadata.query_start_loc_cpu[: num_reqs + 1].tolist()),
                 tuple(seq_lens_cpu[:num_reqs].tolist()),
             )
+            if reuse_decode:
+                signature = ("decode", decode_signature, signature)
             self.common_ratio_to_sas_metadata["sawtooth_sas_scope"] = (shared_sas, signature)
         else:
             self.common_ratio_to_sas_metadata.pop("sawtooth_sas_scope", None)
@@ -1388,6 +1398,15 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             cos, sin = get_cos_and_sin_dsa(
                 input_positions,
                 use_cache=can_use_rope_cache and self.num_prefills == 0 and not is_dspark,
+                use_fused_gather=(
+                    HAS_TRITON
+                    and envs.VLLM_ASCEND_FUSED_ROPE_GATHER
+                    and full_graph_mode
+                    and cache.get("sawtooth_sas_decode", False)
+                    and self.num_prefills == 0
+                    and self.speculative_config is None
+                    and not self._device_metadata_enabled
+                ),
             )
             if (
                 is_dspark
@@ -1867,12 +1886,20 @@ class AscendDSAAttentionMetadataBuilder(AscendDSAMetadataBuilder):
                 has_cmp_kv=self.compressor_ratio > 1,
             )
             scope = metadata_cache.get("sawtooth_sas_scope")
+            # A3 Decode uses empty KV offsets and seqused_kv instead. Nonempty
+            # dynamic offsets (including A5) are deliberately not shared.
+            decode_offsets = (
+                metadata_cache.get("sawtooth_sas_decode", False)
+                and cu_seqlens_ori_kv is not None
+                and cu_seqlens_ori_kv.numel() == 0
+                and cu_seqlens_cmp_kv is not None
+                and cu_seqlens_cmp_kv.numel() == 0
+            )
             if (
                 scope is not None
                 and not dspark_swa
                 and self.seqused_q.numel() == 0
-                and cu_seqlens_ori_kv is query_start_loc
-                and cu_seqlens_cmp_kv is None
+                and (decode_offsets or (cu_seqlens_ori_kv is query_start_loc and cu_seqlens_cmp_kv is None))
                 and not isinstance(max_seqlen_q, torch.Tensor)
                 and not isinstance(max_seqlen_kv, torch.Tensor)
             ):

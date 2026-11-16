@@ -62,7 +62,7 @@ class SawtoothRunnerRuntime:
             raise ValueError("Sawtooth stage runtime requires a model with a fixed stage plan")
         parallel = runner.vllm_config.parallel_config
         reuse = (
-            self.plan.config.enable_sas_metadata_reuse
+            (self.plan.config.enable_sas_metadata_reuse or self.plan.config.enable_decode_sas_metadata_reuse)
             and parallel.pipeline_parallel_size == 2
             and parallel.prefill_context_parallel_size == 4
             and parallel.tensor_parallel_size == 1
@@ -109,8 +109,11 @@ class SawtoothRunnerRuntime:
                 from vllm.v1.worker.gpu.pcp_manager import maybe_build_pcp_manager
 
                 view.pcp_manager = maybe_build_pcp_manager(
-                    runner.vllm_config, runner.device, runner.supports_mm_inputs,
-                    runner.block_tables, cls=runner.pcp_manager_cls,
+                    runner.vllm_config,
+                    runner.device,
+                    runner.supports_mm_inputs,
+                    runner.block_tables,
+                    cls=runner.pcp_manager_cls,
                 )
                 view.pcp_manager.vllm_config = runner.vllm_config
                 view.pcp_manager.kv_cache_config = runner.kv_cache_config

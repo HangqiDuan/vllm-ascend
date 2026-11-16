@@ -6,8 +6,8 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, call
 
-import pytest
 import numpy as np
+import pytest
 import torch
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.sawtooth import SawtoothExecution, SawtoothRequestStep
@@ -28,19 +28,19 @@ def test_interleaved_prompt_chunks_restore_each_groups_own_positions():
     runner.req_states.num_computed_tokens_np = np.zeros(1, dtype=np.int32)
     runner.req_states.num_computed_prefill_tokens = np.zeros(1, dtype=np.int32)
     runner.req_states.prefill_len = SimpleNamespace(np=np.array([16384]))
-    runner.req_states.num_computed_tokens = SimpleNamespace(
-        gpu=torch.zeros(1, dtype=torch.int32)
-    )
+    runner.req_states.num_computed_tokens = SimpleNamespace(gpu=torch.zeros(1, dtype=torch.int32))
     runner.sawtooth_runtime.activate = lambda _: nullcontext()
     observed = []
 
     def forward(output, intermediate):
-        observed.append((
-            output.sawtooth_execution.batch_id,
-            output.sawtooth_execution.round_id,
-            int(runner.req_states.num_computed_tokens_np[0]),
-            int(runner.req_states.num_computed_tokens.gpu[0]),
-        ))
+        observed.append(
+            (
+                output.sawtooth_execution.batch_id,
+                output.sawtooth_execution.round_id,
+                int(runner.req_states.num_computed_tokens_np[0]),
+                int(runner.req_states.num_computed_tokens.gpu[0]),
+            )
+        )
 
     runner.execute_model = forward
     steps = [
@@ -56,8 +56,10 @@ def test_interleaved_prompt_chunks_restore_each_groups_own_positions():
         if group == 1:
             runner.pp_handler.complete_sample()
     assert observed == [
-        (0, 0, 0, 0), (1, 0, 10240, 10240),
-        (0, 1, 0, 0), (1, 1, 10240, 10240),
+        (0, 0, 0, 0),
+        (1, 0, 10240, 10240),
+        (0, 1, 0, 0),
+        (1, 1, 10240, 10240),
     ]
 
 
@@ -193,9 +195,13 @@ def test_stage_payload_excludes_pcp_padding(local_tokens):
     runner.sawtooth_runtime.activate = lambda _: nullcontext()
     payload = torch.arange(10240).reshape(-1, 1)
     runner.execute_model = Mock(return_value=IntermediateTensors({"hidden_states": payload}))
-    runner.pcp_manager = None if local_tokens is None else SimpleNamespace(
-        global_batch=SimpleNamespace(num_scheduled_tokens=np.array([10240]), is_prefilling_np=np.array([True])),
-        get_num_tokens_for_dispatch=lambda *args: local_tokens,
+    runner.pcp_manager = (
+        None
+        if local_tokens is None
+        else SimpleNamespace(
+            global_batch=SimpleNamespace(num_scheduled_tokens=np.array([10240]), is_prefilling_np=np.array([True])),
+            get_num_tokens_for_dispatch=lambda *args: local_tokens,
+        )
     )
     output = make_output(scheduled={"r": 10240})
     output.total_num_scheduled_tokens = 10240
@@ -218,12 +224,18 @@ def test_sas_cache_survives_interleaving_and_retires_on_last_round_or_failure(fa
     runner.model_state = SimpleNamespace()
     runner.sawtooth_runtime.activate = lambda _: nullcontext()
     runner.sawtooth_runtime.sas_metadata_caches = {}
-    runner.sawtooth_runtime.plan = SimpleNamespace(config=SimpleNamespace(max_live_batches=2))
+    runner.sawtooth_runtime.plan = SimpleNamespace(
+        config=SimpleNamespace(
+            max_live_batches=2, enable_sas_metadata_reuse=True, enable_decode_sas_metadata_reuse=True
+        )
+    )
     observed = []
+
     def forward(output, intermediate):
         observed.append(runner.model_state.sawtooth_sas_cache)
         if fail and len(observed) == 3:
             raise RuntimeError("forward failed")
+
     runner.execute_model = forward
     steps = [SawtoothRequestStep("r", 0, i, i * 10240, (i + 1) * 10240, False) for i in range(2)]
     for seq, (batch, group) in enumerate([(0, 0), (1, 0), (0, 1), (1, 1)]):

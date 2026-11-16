@@ -17,6 +17,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import os
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 
@@ -39,6 +40,7 @@ from vllm_ascend.attention.context_parallel.common_cp import is_pcp_decode_shard
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
+from vllm_ascend.worker.v2.fused_pcp_gather import fused_gather
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 
 
@@ -140,6 +142,8 @@ class AscendPCPManager(PCPManager):
         # piecewise/FULL graphs where each rank pads its local batch to the
         # same global padded length.
         self._sampling_hidden_restored = False
+        self._fused_pcp_gather_enabled = os.environ.get("VLLM_ASCEND_FUSED_PCP_BLOCK_TABLES", "0") == "1"
+        self._prepared_global_gather = None
 
     def bind_config(self, vllm_config: VllmConfig) -> None:
         self.vllm_config = vllm_config
@@ -690,6 +694,57 @@ class AscendPCPManager(PCPManager):
             hidden_restore_idx=torch.arange(num_tokens, device=self.device),
         )
 
+    def prepare_attn(self, input_batch: AscendInputBatch):
+        self._prepared_global_gather = None
+        tables = self._block_tables
+        if tables is not None:
+            tables._ascend_dual_gather_owner = None
+        global_batch = self._global_batch
+        if (
+            not getattr(self, "_fused_pcp_gather_enabled", False)
+            or global_batch is None
+            or input_batch.is_dummy
+            or global_batch.is_dummy
+            or global_batch.has_prefill
+        ):
+            return super().prepare_attn(input_batch)
+        assert tables is not None
+        assert self._local_block_tables is not None
+        assert self._local_block_table_ptrs is not None
+        fused_gather(
+            global_idx=global_batch.idx_mapping,
+            local_idx=input_batch.idx_mapping,
+            src_ptrs=tables.block_table_ptrs,
+            global_out_ptrs=tables.input_block_table_ptrs,
+            local_out_ptrs=self._local_block_table_ptrs,
+            strides=tables.block_table_strides,
+            num_blocks=tables.num_blocks.gpu,
+            global_pad=global_batch.num_reqs_after_padding,
+            local_pad=input_batch.num_reqs_after_padding,
+        )
+        slot_mappings = self.prepare_slot_mappings()
+        # This is a one-use handoff within preparation, not a cross-step cache.
+        # Local stage managers share the global destination: another manager's
+        # preparation must invalidate this handoff even for the same batch.
+        token = object()
+        tables._ascend_dual_gather_owner = token
+        self._prepared_global_gather = (global_batch, input_batch, token)
+        return (
+            tuple(bt[: input_batch.num_reqs_after_padding] for bt in self._local_block_tables),
+            slot_mappings,
+        )
+
+    def _gather_global_block_tables(self, global_batch, local_batch):
+        prepared = getattr(self, "_prepared_global_gather", None)
+        self._prepared_global_gather = None
+        tables = self._block_tables
+        assert tables is not None
+        owner = getattr(tables, "_ascend_dual_gather_owner", None)
+        tables._ascend_dual_gather_owner = None
+        if prepared is not None and prepared[0] is global_batch and prepared[1] is local_batch and prepared[2] is owner:
+            return tuple(bt[: global_batch.num_reqs_after_padding] for bt in tables.input_block_tables)
+        return tables.gather_block_tables(global_batch.idx_mapping, global_batch.num_reqs_after_padding)
+
     def build_attention_context(
         self,
         input_batch: AscendInputBatch | None = None,
@@ -698,6 +753,9 @@ class AscendPCPManager(PCPManager):
     ) -> AscendPCPAttentionContext:
         """Build PCP context for the current real, capture, or idle DP batch."""
         if input_batch is not None and input_batch.is_dummy and not input_batch.is_cpp_profile:
+            self._prepared_global_gather = None
+            if self._block_tables is not None:
+                self._block_tables._ascend_dual_gather_owner = None
             # Both capture and runtime dummy batches bypass partition_batch().
             # Saved layout state may be absent or belong to a previous request.
             assert block_tables is not None
@@ -742,10 +800,7 @@ class AscendPCPManager(PCPManager):
             global_batch=global_batch,
             local_to_global_req_indices=local_to_global_req_indices,
             local_token_indices=self._local_gather_idx[: local_batch.num_tokens],
-            global_block_tables=self._block_tables.gather_block_tables(
-                global_batch.idx_mapping,
-                global_batch.num_reqs_after_padding,
-            ),
+            global_block_tables=self._gather_global_block_tables(global_batch, local_batch),
             global_slot_mappings=self._global_batch_slot_mappings[:, : global_batch.num_tokens_after_padding],
             hidden_restore_idx=hidden_restore_idx,
             padded_gather_idx=self._padded_gather_idx,

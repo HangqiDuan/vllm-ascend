@@ -526,12 +526,18 @@ class AscendModelState(DefaultModelState):
         if self.device_metadata is not None:
             build_metadata = partial(self.device_metadata.run_build, build_attn_metadata)
         self._decoder_replay_common_metadata = {}
+        sas_cache = getattr(self, "sawtooth_sas_cache", None)
+        if sas_cache is not None:
+            sas_cache = sas_cache.for_input(
+                input_batch,
+                full_graph=cudagraph_mode == CUDAGraphMode.FULL,
+                global_batch=pcp_context.global_batch if pcp_context is not None else None,
+                for_capture=for_capture,
+                device_metadata=self.device_metadata is not None,
+                speculative=self.vllm_config.speculative_config is not None,
+            )
         self.attn_metadata = build_metadata(
-            sawtooth_sas_cache=(
-                getattr(self, "sawtooth_sas_cache", None)
-                if not for_capture and not input_batch.is_dummy and cudagraph_mode != CUDAGraphMode.FULL
-                else None
-            ),
+            sawtooth_sas_cache=sas_cache,
             attn_groups=attn_groups,
             num_reqs=num_reqs,
             num_actual_reqs=num_actual_reqs,
@@ -566,9 +572,11 @@ class AscendModelState(DefaultModelState):
             copy_sfa_restore_tails=restore_copy_sfa_tails,
             draft_layer_names=getattr(self, "_offload_draft_layer_names", None),
             common_metadata_callback=(
-                lambda group_id, common: self._decoder_replay_common_metadata.__setitem__(group_id, common)
-                if self.decoder_replay is not None
-                else None
+                lambda group_id, common: (
+                    self._decoder_replay_common_metadata.__setitem__(group_id, common)
+                    if self.decoder_replay is not None
+                    else None
+                )
             ),
         )
         self._prepare_decoder_replay(input_batch, cudagraph_mode, attn_groups, kv_cache_config)

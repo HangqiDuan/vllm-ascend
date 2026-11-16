@@ -836,6 +836,7 @@ def test_build_reuses_batched_slot_values_in_persistent_buffer():
         num_actual_tokens=count,
         num_input_tokens=count,
         seq_lens=lengths,
+        seq_lens_cpu=lengths,
         block_table_tensor=torch.tensor([[4, 8]], dtype=torch.int32),
         query_start_loc=torch.tensor([0, count], dtype=torch.int32),
         query_start_loc_cpu=torch.tensor([0, count], dtype=torch.int32),
@@ -3101,24 +3102,38 @@ def test_sparse_flash_forward_requires_draft_metadata(is_draft):
 @pytest.mark.parametrize("changed", ["query", "seq", "window", "topk", "dynamic_q"])
 def test_sawtooth_sas_reuses_equivalent_builders_but_recomputes_changed_inputs(changed, implementation):
     from vllm_ascend.worker.v2.sawtooth_metadata import SawtoothSASCache
+
     shared = SawtoothSASCache()
     first, later = _make_builder(4), _make_builder(4)
     count = []
+
     def metadata_op(**kw):
         count.append(kw)
         return torch.full((DSA_METADATA_BUFFER_SIZE,), len(count), dtype=torch.int32)
+
     plan = _mock_dsa_kv_plan(get_dsa_sparse_attn_metadata_op=metadata_op, get_dsa_sparse_attn_metadata_kwargs={})
+
     def build(builder, q=8, seq=16, window=127):
         offsets = torch.tensor([0, q], dtype=torch.int32)
         local_cache = {"sawtooth_sas_scope": (shared, ((0, q), (seq,)))}
         return implementation._build_sas_metadata(
-            builder, metadata_cache=local_cache, layer_name="c4", query_start_loc=offsets,
-            seq_lens=torch.tensor([seq], dtype=torch.int32), max_seqlen_q=q,
-            max_seqlen_kv=seq, cu_seqlens_ori_kv=offsets, cu_seqlens_cmp_kv=None,
-            ori_win_left=window, ori_win_right=0, dspark_swa=False,
+            builder,
+            metadata_cache=local_cache,
+            layer_name="c4",
+            query_start_loc=offsets,
+            seq_lens=torch.tensor([seq], dtype=torch.int32),
+            max_seqlen_q=q,
+            max_seqlen_kv=seq,
+            cu_seqlens_ori_kv=offsets,
+            cu_seqlens_cmp_kv=None,
+            ori_win_left=window,
+            ori_win_right=0,
+            dspark_swa=False,
         ).clone()
-    with patch("vllm_ascend.attention.dsa_v1.get_dsa_attn_kv_plan", return_value=plan), patch(
-        "vllm_ascend.attention.dsa_v1.get_tensor_model_parallel_world_size", return_value=1
+
+    with (
+        patch("vllm_ascend.attention.dsa_v1.get_dsa_attn_kv_plan", return_value=plan),
+        patch("vllm_ascend.attention.dsa_v1.get_tensor_model_parallel_world_size", return_value=1),
     ):
         assert build(first)[0].item() == 1
         assert build(later)[0].item() == 1
@@ -3137,3 +3152,60 @@ def test_sawtooth_sas_reuses_equivalent_builders_but_recomputes_changed_inputs(c
             later.seqused_q.fill_(4)
             result = build(later)
         assert result[0].item() == (3 if changed == "dynamic_q" else 2)
+
+
+@pytest.mark.parametrize("changed", ["seq", "order", "step", "window", "dynamic_offsets", "new_batch"])
+def test_decode_sas_reuse_preserves_stage_buffers_and_invalidates_changed_inputs(changed):
+    from vllm_ascend.worker.v2.sawtooth_metadata import SawtoothSASCache
+
+    shared = SawtoothSASCache(enable_decode=True)
+    first, later = _make_builder(4), _make_builder(4)
+    calls = []
+
+    def metadata_op(**kw):
+        calls.append(kw)
+        return torch.full((DSA_METADATA_BUFFER_SIZE,), len(calls), dtype=torch.int32)
+
+    plan = _mock_dsa_kv_plan(get_dsa_sparse_attn_metadata_op=metadata_op, get_dsa_sparse_attn_metadata_kwargs={})
+
+    def build(builder, seq=128, order=("a",), step=128, window=127, dynamic=False):
+        signature = ("decode", (order, (step,), 1, 1), ((0, 1), (seq,)))
+        local = {"sawtooth_sas_scope": (shared, signature), "sawtooth_sas_decode": True}
+        empty = torch.tensor([], dtype=torch.int32)
+        return builder._build_sas_metadata(
+            metadata_cache=local,
+            layer_name="c4",
+            query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+            seq_lens=torch.tensor([seq], dtype=torch.int32),
+            max_seqlen_q=1,
+            max_seqlen_kv=seq,
+            cu_seqlens_ori_kv=torch.tensor([0, seq]) if dynamic else empty,
+            cu_seqlens_cmp_kv=empty,
+            ori_win_left=window,
+            ori_win_right=0,
+            dspark_swa=False,
+        )
+
+    with (
+        patch("vllm_ascend.attention.dsa_v1.get_dsa_attn_kv_plan", return_value=plan),
+        patch("vllm_ascend.attention.dsa_v1.get_tensor_model_parallel_world_size", return_value=1),
+    ):
+        a = build(first)
+        b = build(later)
+        assert a.data_ptr() != b.data_ptr()
+        assert torch.equal(a, b)
+        assert len(calls) == 1
+        args = {
+            "seq": dict(seq=129),
+            "order": dict(order=("b",)),
+            "step": dict(step=129),
+            "window": dict(window=63),
+            "dynamic_offsets": dict(dynamic=True),
+            "new_batch": {},
+        }[changed]
+        if changed == "new_batch":
+            shared = SawtoothSASCache(enable_decode=True)
+        result = build(later, **args)
+        assert result[0].item() == 2
+        assert result.data_ptr() == b.data_ptr() if changed != "window" else True
+        assert a[0].item() == 1

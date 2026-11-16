@@ -287,7 +287,11 @@ def test_profile_scope_needs_no_kv_metadata_and_preserves_dummy_query_flags():
 @pytest.mark.parametrize("with_pcp", [False, True])
 def test_executable_runtime_reuses_profile_state_and_buffer_addresses(monkeypatch, with_pcp):
     stage = SimpleNamespace(group_id=2, round_id=0, is_first=False, is_last=False)
-    plan = SimpleNamespace(plan_id="plan", local_stages=lambda _: [stage], config=SimpleNamespace(enable_sas_metadata_reuse=False))
+    plan = SimpleNamespace(
+        plan_id="plan",
+        local_stages=lambda _: [stage],
+        config=SimpleNamespace(enable_sas_metadata_reuse=False, enable_decode_sas_metadata_reuse=False),
+    )
     model = object()
     state = SimpleNamespace()
     profile = sawtooth_runtime.SawtoothStageResources(
@@ -346,16 +350,23 @@ def test_stage_capture_uses_replay_input_buffers(with_pcp):
     global_inputs, local_inputs = object(), object()
     capture = Mock()
     resource = SimpleNamespace(
-        model=object(), model_state=object(), input_buffers=global_inputs,
+        model=object(),
+        model_state=object(),
+        input_buffers=global_inputs,
         intermediate_tensors=object(),
-        view=SimpleNamespace(attn_groups=[], pcp_manager=SimpleNamespace(input_buffers=local_inputs) if with_pcp else None),
+        view=SimpleNamespace(
+            attn_groups=[], pcp_manager=SimpleNamespace(input_buffers=local_inputs) if with_pcp else None
+        ),
         manager=SimpleNamespace(capture=capture),
     )
     runtime.__dict__.update(
-        original_model=object(), stages={0: resource},
+        original_model=object(),
+        stages={0: resource},
         runner=SimpleNamespace(block_tables=object(), kv_cache_config=object()),
-        _max_full_descs_to_capture=None, _capture_mem_samples=None,
-        refresh_shared_state=lambda: None, activate=lambda _: nullcontext(),
+        _max_full_descs_to_capture=None,
+        _capture_mem_samples=None,
+        refresh_shared_state=lambda: None,
+        activate=lambda _: nullcontext(),
     )
     runtime.capture(runtime.original_model)
     assert capture.call_args.args[2] is (local_inputs if with_pcp else global_inputs)

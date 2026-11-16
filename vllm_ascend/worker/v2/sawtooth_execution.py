@@ -12,9 +12,7 @@ from vllm_ascend.worker.v2.sawtooth_metadata import SawtoothSASCache
 def _admit(runner, output, batch_id):
     if not isinstance(runner.pp_handler, KeyedPPHandler):
         runner.pp_handler = KeyedPPHandler(runner.pp_handler)
-        runner.pp_handler.allow_prefill_overlap = (
-            runner.sawtooth_runtime.plan.config.enable_prefill_chunk_overlap
-        )
+        runner.pp_handler.allow_prefill_overlap = runner.sawtooth_runtime.plan.config.enable_prefill_chunk_overlap
     cleanup = output.finished_req_ids | set(output.preempted_req_ids or ())
     # A resumed/streaming NewRequestData replaces an old worker allocation even
     # when it is re-added in this same command. Consume its old dependency first.
@@ -71,14 +69,11 @@ def execute_round(runner, output, intermediate):
         runner.pp_handler.begin_round(execution.round_id, steps)
     for rid, step in steps.items():
         index = runner.req_states.req_id_to_index[rid]
-        if (
-            output.num_scheduled_tokens[rid] != step.token_end - step.token_start
-            or (
-                not overlap
-                and (
-                    runner.pp_handler.current_steps.get(rid) != step
-                    or runner.req_states.num_computed_tokens_np[index] != step.token_start
-                )
+        if output.num_scheduled_tokens[rid] != step.token_end - step.token_start or (
+            not overlap
+            and (
+                runner.pp_handler.current_steps.get(rid) != step
+                or runner.req_states.num_computed_tokens_np[index] != step.token_start
             )
         ):
             raise RuntimeError("Sawtooth continuation input version changed")
@@ -102,7 +97,10 @@ def execute_round(runner, output, intermediate):
             limit = runtime.plan.config.max_live_batches or 2
             if len(caches) >= limit:
                 caches.clear()
-            caches[cache_key] = SawtoothSASCache()
+            caches[cache_key] = SawtoothSASCache(
+                enable_prefill=runtime.plan.config.enable_sas_metadata_reuse,
+                enable_decode=runtime.plan.config.enable_decode_sas_metadata_reuse,
+            )
         sas_cache = caches.get(cache_key)
     with runtime.activate(execution.round_id):
         runner._sawtooth_skip_lifecycle = True

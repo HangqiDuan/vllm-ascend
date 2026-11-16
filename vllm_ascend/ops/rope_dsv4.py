@@ -109,7 +109,13 @@ def get_cos_and_sin_dsa(
     use_cache: bool = False,
     draft_index: int | None = None,
     layer_names: str | Iterable[str] | None = None,
+    *,
+    use_fused_gather: bool = False,
 ):
+    if use_fused_gather:
+        # Lazy import keeps the default path independent of Triton.
+        from vllm_ascend.ops.fused_rope_gather import try_fused_rope_gather
+
     if isinstance(positions, torch.Tensor):
         pos_map = {"default": positions}
     else:
@@ -141,6 +147,23 @@ def get_cos_and_sin_dsa(
         for group_name, pos_tensor in pos_map.items():
             if group_name not in registered_groups:
                 continue
+
+            if use_fused_gather and draft_index is None:
+                # The caller owns the same buffers as the original path. Only
+                # this step's two table reads are fused; no values are cached.
+                num_tokens = pos_tensor.size(0)
+                if use_cache:
+                    outputs = _ROPE_STATE.runtime_buffer.get(config_key, {}).get(group_name)
+                    if outputs is None:
+                        continue
+                else:
+                    outputs = (
+                        full_rope_cos.new_empty((num_tokens, *full_rope_cos.shape[1:])),
+                        full_rope_sin.new_empty((num_tokens, *full_rope_sin.shape[1:])),
+                    )
+                if try_fused_rope_gather(full_rope_cos, full_rope_sin, pos_tensor, *outputs):
+                    batch_result[config_key][group_name] = (outputs[0][:num_tokens], outputs[1][:num_tokens])
+                    continue
 
             if use_cache:
                 group_buffers = (
